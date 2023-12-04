@@ -13,6 +13,14 @@ import comfy.conds
 #Returns denoised
 def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
         def get_area_and_mult(conds, x_in, timestep_in):
+            batch_offset = -1
+            old_shape = x_in.shape
+            new_shape = x_in.shape
+            if 'batch_offset' in conds:
+                batch_offset = conds['batch_offset']
+                x_in = x_in[batch_offset:]
+                new_shape = x_in.shape
+
             area = (x_in.shape[2], x_in.shape[3], 0, 0)
             strength = 1.0
 
@@ -82,7 +90,7 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
 
                 patches['middle_patch'] = [gligen_patch]
 
-            return (input_x, mult, conditionning, area, control, patches)
+            return (input_x, mult, conditionning, area, control, patches, batch_offset)
 
         def cond_equal_size(c1, c2):
             if c1 is c2:
@@ -185,6 +193,7 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                 area = []
                 control = None
                 patches = None
+                batch_offset = -1
                 for x in to_batch:
                     o = to_run.pop(x)
                     p = o[0]
@@ -195,6 +204,7 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                     cond_or_uncond += [o[1]]
                     control = p[4]
                     patches = p[5]
+                    batch_offset = p[6]
 
                 batch_chunks = len(cond_or_uncond)
                 input_x = torch.cat(input_x)
@@ -231,12 +241,25 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                 del input_x
 
                 for o in range(batch_chunks):
-                    if cond_or_uncond[o] == COND:
-                        out_cond[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
-                        out_count[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
+                    if batch_offset < 0:
+                        if cond_or_uncond[o] == COND:
+                            out_cond[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
+                            out_count[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
+                        else:
+                            out_uncond[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
+                            out_uncond_count[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
                     else:
-                        out_uncond[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
-                        out_uncond_count[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
+                        if cond_or_uncond[o] == COND:
+                            if batch_offset > out_cond.shape[0]:
+                                raise Exception(f"Batch offset must be smaller than the batch size. Positive conditioning offset was {batch_offset} but the batch size was {out_cond.shape[0]}")
+                            out_cond[batch_offset,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
+                            out_count[batch_offset,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
+                        else:
+                            if batch_offset > out_uncond.shape[0]:
+                                raise Exception(f"Batch offset must be smaller than the batch size. Negative conditioning offset was {batch_offset} but the batch size was {out_uncond.shape[0]}")
+                            out_uncond[batch_offset,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
+                            out_uncond_count[batch_offset,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
+
                 del mult
 
             out_cond /= out_count
