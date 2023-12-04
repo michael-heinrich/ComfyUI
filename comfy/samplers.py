@@ -14,12 +14,14 @@ import comfy.conds
 def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
         def get_area_and_mult(conds, x_in, timestep_in):
             batch_offset = -1
-            old_shape = x_in.shape
-            new_shape = x_in.shape
+            old_shape = timestep_in.shape
+            new_shape = timestep_in.shape
             if 'batch_offset' in conds:
                 batch_offset = conds['batch_offset']
-                x_in = x_in[batch_offset:]
-                new_shape = x_in.shape
+                # use the element with index batch_offset in the first dimension and all elements in the other dimensions
+                x_in = x_in[batch_offset:batch_offset+1]
+                timestep_in = timestep_in[batch_offset:batch_offset+1]
+                new_shape = timestep_in.shape
 
             area = (x_in.shape[2], x_in.shape[3], 0, 0)
             strength = 1.0
@@ -141,6 +143,39 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                 out[k] = conds[0].concat(conds[1:])
 
             return out
+        
+        
+        DENSE_CONDITIONING = 'dense_conditioning'
+        BLOCK_DIAGONAL_CONDITIONING = 'block_diagonal_conditioning'
+
+        def select_conditioning_mode(conds, batch_size):
+            # if any of the conditionings requests block diagonal conditioning or
+            # dense conditioning, we need to use that mode for all conditionings
+            # that don't request indexed conditioning individually
+
+            if conds is None:
+                return DENSE_CONDITIONING
+
+            for c in conds:
+                mode = c.get('conditioning_mode', None)
+                if mode == DENSE_CONDITIONING or mode == BLOCK_DIAGONAL_CONDITIONING:
+                    return mode
+                
+            # if none of the conditionings requests block diagonal conditioning or
+            # dense conditioning, we check if the number of conditionings is suitable
+            # for block diagonal conditioning
+
+            # check if there number of conds is at least the number of images in the batch
+            if len(conds) < batch_size:
+                return DENSE_CONDITIONING
+
+            # check if the number of conds is divisible by the batch size without remainder
+            if len(conds) % batch_size != 0:
+                return DENSE_CONDITIONING
+            
+            # for debugging, block diagonal conditioning is the default
+            return BLOCK_DIAGONAL_CONDITIONING
+
 
         def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
             out_cond = torch.zeros_like(x_in)
@@ -152,20 +187,59 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
             COND = 0
             UNCOND = 1
 
+            # first, select the default conditioning batch mode, based on the number 
+            # of present conditionings and the batch size
+            cond_mode = select_conditioning_mode(cond, x_in.shape[0])
+            uncond_mode = select_conditioning_mode(uncond, x_in.shape[0])
+            
             to_run = []
-            for x in cond:
-                p = get_area_and_mult(x, x_in, timestep)
-                if p is None:
-                    continue
 
-                to_run += [(p, COND)]
-            if uncond is not None:
-                for x in uncond:
+            if cond_mode == DENSE_CONDITIONING:
+                for x in cond:
                     p = get_area_and_mult(x, x_in, timestep)
                     if p is None:
                         continue
 
-                    to_run += [(p, UNCOND)]
+                    to_run += [(p, COND)]
+
+            else:
+                n_conds = len(cond)
+                conds_per_image = n_conds // x_in.shape[0]
+
+                for i, x in enumerate(cond):
+                    batch_offset = x.get('batch_offset', i // conds_per_image)
+                    x['batch_offset'] = batch_offset
+                    p = get_area_and_mult(x, x_in, timestep)
+                    if p is None:
+                        continue
+
+                    to_run += [(p, COND)]
+
+            if uncond is not None:
+                if uncond_mode == DENSE_CONDITIONING:
+                    for x in uncond:
+                        p = get_area_and_mult(x, x_in, timestep)
+                        if p is None:
+                            continue
+
+                        to_run += [(p, UNCOND)]
+
+                else:
+                    n_unconds = len(uncond) if uncond is not None else 0
+                    unconds_per_image = n_unconds // x_in.shape[0]
+
+                    for i, x in enumerate(uncond):
+                        batch_offset = x.get('batch_offset', i // unconds_per_image)
+                        x['batch_offset'] = batch_offset
+                        p = get_area_and_mult(x, x_in, timestep)
+                        if p is None:
+                            continue
+
+                        to_run += [(p, UNCOND)]
+
+
+
+                
 
             while len(to_run) > 0:
                 first = to_run[0]
@@ -191,9 +265,9 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                 c = []
                 cond_or_uncond = []
                 area = []
+                batch_offset = []
                 control = None
                 patches = None
-                batch_offset = -1
                 for x in to_batch:
                     o = to_run.pop(x)
                     p = o[0]
@@ -204,12 +278,17 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                     cond_or_uncond += [o[1]]
                     control = p[4]
                     patches = p[5]
-                    batch_offset = p[6]
+                    batch_offset += [p[6]]
 
                 batch_chunks = len(cond_or_uncond)
                 input_x = torch.cat(input_x)
                 c = cond_cat(c)
-                timestep_ = torch.cat([timestep] * batch_chunks)
+                n_evaluations = input_x.shape[0]
+
+                # this is more of a hack than a proper solution, however timesteps
+                # are uniform across the batch, so we can just repeat the timestep
+                timestep_repeats = n_evaluations // timestep.shape[0]
+                timestep_ = torch.cat([timestep] * timestep_repeats)
 
                 if control is not None:
                     c['control'] = control.get_control(input_x, timestep_, c, len(cond_or_uncond))
@@ -241,7 +320,8 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                 del input_x
 
                 for o in range(batch_chunks):
-                    if batch_offset < 0:
+                    off = batch_offset[o]
+                    if off < 0:
                         if cond_or_uncond[o] == COND:
                             out_cond[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
                             out_count[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
@@ -250,15 +330,15 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                             out_uncond_count[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
                     else:
                         if cond_or_uncond[o] == COND:
-                            if batch_offset > out_cond.shape[0]:
-                                raise Exception(f"Batch offset must be smaller than the batch size. Positive conditioning offset was {batch_offset} but the batch size was {out_cond.shape[0]}")
-                            out_cond[batch_offset,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
-                            out_count[batch_offset,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
+                            if off > out_cond.shape[0]:
+                                raise Exception(f"Batch offset must be smaller than the batch size. Positive conditioning offset was {off} but the batch size was {out_cond.shape[0]}")
+                            out_cond[off:off+1,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
+                            out_count[off:off+1,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
                         else:
-                            if batch_offset > out_uncond.shape[0]:
-                                raise Exception(f"Batch offset must be smaller than the batch size. Negative conditioning offset was {batch_offset} but the batch size was {out_uncond.shape[0]}")
-                            out_uncond[batch_offset,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
-                            out_uncond_count[batch_offset,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
+                            if off > out_uncond.shape[0]:
+                                raise Exception(f"Batch offset must be smaller than the batch size. Negative conditioning offset was {off} but the batch size was {out_uncond.shape[0]}")
+                            out_uncond[off:off+1,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
+                            out_uncond_count[off:off+1,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
 
                 del mult
 
