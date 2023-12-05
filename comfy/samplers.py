@@ -148,33 +148,57 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
         DENSE_CONDITIONING = 'dense_conditioning'
         BLOCK_DIAGONAL_CONDITIONING = 'block_diagonal_conditioning'
 
-        def select_conditioning_mode(conds, batch_size):
+        def select_conditioning_mode(conds, batch_size, polarity):
             # if any of the conditionings requests block diagonal conditioning or
             # dense conditioning, we need to use that mode for all conditionings
             # that don't request indexed conditioning individually
 
             if conds is None:
-                return DENSE_CONDITIONING
-
-            for c in conds:
-                mode = c.get('conditioning_mode', None)
-                if mode == DENSE_CONDITIONING or mode == BLOCK_DIAGONAL_CONDITIONING:
-                    return mode
-                
-            # if none of the conditionings requests block diagonal conditioning or
-            # dense conditioning, we check if the number of conditionings is suitable
-            # for block diagonal conditioning
-
-            # check if there number of conds is at least the number of images in the batch
-            if len(conds) < batch_size:
-                return DENSE_CONDITIONING
-
-            # check if the number of conds is divisible by the batch size without remainder
-            if len(conds) % batch_size != 0:
+                print(f"Default to dense conditioning to handle 'None' for {polarity} conditionings")
                 return DENSE_CONDITIONING
             
-            # for debugging, block diagonal conditioning is the default
-            return BLOCK_DIAGONAL_CONDITIONING
+            dense_requested = False
+            block_diagonal_requested = False
+            
+            for c in conds:
+                mode = c.get('conditioning_mode', None)
+                
+                if mode == DENSE_CONDITIONING:
+                    dense_requested = True
+
+                if mode == BLOCK_DIAGONAL_CONDITIONING:
+                    block_diagonal_requested = True
+
+
+
+            if dense_requested and block_diagonal_requested:
+                print(f"Both dense and block diagonal conditioning requested for {polarity} conditionings, this is not supported. Falling back to dense conditioning.")
+                return DENSE_CONDITIONING
+            
+            if dense_requested:
+                print(f"Dense conditioning requested for {polarity} conditionings, using dense conditioning.")
+                return DENSE_CONDITIONING
+            
+            block_diagonal_ok = True
+
+            if len(conds) < batch_size:
+                block_diagonal_ok = False
+
+            if len(conds) % batch_size != 0:
+                block_diagonal_ok = False
+
+            if not block_diagonal_ok:
+                if block_diagonal_requested:
+                    print(f"Block diagonal conditioning requested for {polarity} conditionings, but the number of conditionings is not divisible by the batch size. Falling back to dense conditioning.")
+                return DENSE_CONDITIONING
+
+            if block_diagonal_requested:
+                print(f"Block diagonal conditioning requested for {polarity} conditionings, using block diagonal conditioning.")
+                return BLOCK_DIAGONAL_CONDITIONING
+
+            
+            print("No explicit conditioning mode requested, using dense conditioning (normal mode)")
+            return DENSE_CONDITIONING
 
 
         def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
@@ -189,8 +213,8 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
 
             # first, select the default conditioning batch mode, based on the number 
             # of present conditionings and the batch size
-            cond_mode = select_conditioning_mode(cond, x_in.shape[0])
-            uncond_mode = select_conditioning_mode(uncond, x_in.shape[0])
+            cond_mode = select_conditioning_mode(cond, x_in.shape[0], 'positive')
+            uncond_mode = select_conditioning_mode(uncond, x_in.shape[0], 'negative')
             
             to_run = []
 
@@ -239,7 +263,7 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
 
 
 
-                
+            ignore_mem_overflow = False    
 
             while len(to_run) > 0:
                 first = to_run[0]
@@ -256,7 +280,7 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                 for i in range(1, len(to_batch_temp) + 1):
                     batch_amount = to_batch_temp[:len(to_batch_temp)//i]
                     input_shape = [len(batch_amount) * first_shape[0]] + list(first_shape)[1:]
-                    if model.memory_required(input_shape) < free_memory:
+                    if model.memory_required(input_shape) < free_memory or ignore_mem_overflow:
                         to_batch = batch_amount
                         break
 
@@ -286,9 +310,9 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                 n_evaluations = input_x.shape[0]
 
                 # this is more of a hack than a proper solution, however timesteps
-                # are uniform across the batch, so we can just repeat the timestep
-                timestep_repeats = n_evaluations // timestep.shape[0]
-                timestep_ = torch.cat([timestep] * timestep_repeats)
+                # are uniform across the batch, so we can just repeat the timestep.
+                # make a torch tensor that is just a vector of the timestep repeated 'n_evaluations' times
+                timestep_ = torch.ones(n_evaluations, dtype=torch.float32, device=input_x.device) * timestep[0]
 
                 if control is not None:
                     c['control'] = control.get_control(input_x, timestep_, c, len(cond_or_uncond))

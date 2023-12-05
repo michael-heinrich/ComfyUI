@@ -106,6 +106,271 @@ class ConditioningAverage :
             out.append(n)
         return (out, )
 
+class ModelFramePinning:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                              "images": ("LATENT", ),
+                              "model": ("MODEL", ),
+                              "batch_index": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1}),
+                              "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                             },
+                             }
+    
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "pin_frame"
+
+    CATEGORY = "conditioning"
+
+    def pin_frame(self, images, model, batch_index, strength):
+
+        n_images = images.shape[0]
+
+        preloaded_image = None
+        if n_images > 1:
+            # if there are multiple images, we use batch_index to select the source image
+            preloaded_image = images[batch_index]
+        elif n_images == 0:
+            raise Exception("ModelFramePinning: images is empty, cannot pin frame")
+        else:
+            # if there is only one image, we use that
+            preloaded_image = images[0]
+
+        
+        # capture the call operator of the model into a local variable
+        tmp_call = model.__call__
+
+
+
+        # we want to build a wrapper around this function:
+        # denoised = model(x, sigmas[i] * s_in, **extra_args)
+        # our wrapper will stand in for the call operator of model
+        def call_model(*args, **kwargs):
+            # call the model
+            denoised = tmp_call(*args, **kwargs)
+
+            n_denoised = denoised.shape[0]
+
+            if batch_index >= n_denoised:
+                print(f"ModelFramePinning: batch_index {batch_index} is out of range, skipping pinning")
+                return denoised
+            
+            # load the preloaded image to the device
+            uploaded_preloaded = preloaded_image.to(denoised.device)
+
+            # Mix the denoised image with the preloaded image.
+            # Only modify the targeted image, leave the others untouched.
+            denoised[batch_index] = strength * uploaded_preloaded + (1.0 - strength) * denoised[batch_index]
+            
+            return denoised
+
+
+        # replace the call operator of the model with our wrapper
+        model.__call__ = call_model
+
+        return (model, )
+        
+        
+
+
+class ConditioningStepConvolution:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                              "positive": ("CONDITIONING", ),
+                              "start_step": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1}),
+                              "end_step": ("INT", {"default": 10, "min": -1, "max": 1024, "step": 1}),
+                              "kernel_size": ("INT", {"default": 5, "min": 0, "max": 1024, "step": 1}),
+                              "std_dev": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                              "fade": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                             },
+                            }
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("positive")
+    FUNCTION = "apply_convolution"
+
+    CATEGORY = "conditioning"
+
+    def apply_convolution(self, positive, start_step, end_step, kernel_size, std_dev, fade):
+
+
+        if end_step < 0:
+            return (positive, )
+        
+        def convolution_callback(step, x0, x, total_steps):
+            if step < start_step:
+                return
+
+            if step >= end_step:
+                return
+
+            rel_step = 0
+            if end_step > 1:
+                rel_step = step / (end_step - 1)
+
+            faded_std_dev = std_dev * (1.0 - rel_step * fade)
+
+            # make zeros with the same shape as x
+            crossed_x = torch.zeros_like(x)
+
+            diff = (kernel_size - 1) // 2
+
+            n_images = x.shape[0]
+            for i in range(n_images):
+                indices = []
+                weights = []
+                weight_sum = 0
+
+                # from i - diff to i + diff (inclusive)
+                for j in range(i - diff, i + diff + 1):
+                    if j < 0:
+                        continue
+                    
+                    if j >= n_images:
+                        continue
+                    
+                    indices += [j]
+                    dist = abs(i - j)
+
+                    # gauss falloff with distance and faded std dev, prevent division by zero
+                    weight = 0
+                    if faded_std_dev < 0.0001:
+                        if dist == 0:
+                            weight = 1
+                        else:
+                            weight = 0
+                    else:
+                        weight = math.exp(-(dist * dist) / (2 * faded_std_dev * faded_std_dev))
+
+                    weights += [weight]
+                    weight_sum += weight
+
+                if len(indices) == 0:
+                    # no cross talk for this image
+                    continue
+
+
+                # normalize weights
+                weight_info = {}
+                for j in range(len(weights)):
+                    weights[j] /= weight_sum
+                    weight_info[indices[j]] = weights[j]
+
+                # print convolution weights
+                print(f"convolution: step {step}, image {i}: {weight_info}")
+
+                # calculate the convolution
+                for j in range(len(indices)):
+                    crossed_x[i] += weights[j] * x[indices[j]]
+
+            # copy the crossed x to x
+            x.copy_(crossed_x)
+            return
+        
+        if positive is None or len(positive) == 0:
+            raise Exception("ConditioningStepConvolution: positive conditioning is empty, cannot attach callback")
+
+        # callbacks are not separated between images in a batch, so we just add a single callback
+        # to the first conditioning in the batch. This will be called between steps in the sampler.
+        # The passed data is the batch of latent states.
+        positive[0][1]["sampler_callback"] = convolution_callback
+
+        return (positive, )
+
+
+class ConditioningPromptTravel:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"conditioning_to": ("CONDITIONING", ), "conditioning_from": ("CONDITIONING", ),
+                              "batch_size": ("INT", {"default": 1, "min": 1, "max": 1024, "step": 1}),
+                              "interpolation": (["linear", "cosine"], ),
+                             }}
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "getInbetween"
+
+    CATEGORY = "conditioning"
+
+    def linear_base_function(self, t):
+        '''
+        Linear interpolation between 0 and 1. Returns a value between 0 and 1.
+        '''
+
+        if t < 0:
+            return 0
+        
+        if t > 1:
+            return 1
+        
+        return t
+    
+
+    def cos_base_function(self, t):
+        '''
+        Cosine interpolation between 0 and 1. Returns a value between 0 and 1.
+        '''
+
+        if t < 0:
+            return 0
+        
+        if t > 1:
+            return 1
+        
+        return (1 - math.cos(t * math.pi)) / 2
+
+
+    def getInbetween(self, conditioning_to, conditioning_from, batch_size, interpolation):
+        n_weight_steps = batch_size - 1
+
+        if(n_weight_steps < 1):
+            return (conditioning_to, )
+
+        out = []
+        
+        for i in range(batch_size):
+            t = i / n_weight_steps
+
+            to_strength = 0.5
+
+            if interpolation == "linear":
+                to_strength = self.linear_base_function(t)
+            else:
+                to_strength = self.cos_base_function(t)
+
+            (w_out, ) = self.addWeighted(conditioning_to, conditioning_from, to_strength)
+            out += w_out
+
+        return (out, )
+
+    def addWeighted(self, conditioning_to, conditioning_from, conditioning_to_strength):
+        out = []
+
+        if len(conditioning_from) > 1:
+            print("Warning: ConditioningPromptTravel conditioning_from contains more than 1 cond, only the first one will actually be applied to conditioning_to.")
+
+        cond_from = conditioning_from[0][0]
+        pooled_output_from = conditioning_from[0][1].get("pooled_output", None)
+
+        for i in range(len(conditioning_to)):
+            t1 = conditioning_to[i][0]
+            pooled_output_to = conditioning_to[i][1].get("pooled_output", pooled_output_from)
+            t0 = cond_from[:,:t1.shape[1]]
+            if t0.shape[1] < t1.shape[1]:
+                t0 = torch.cat([t0] + [torch.zeros((1, (t1.shape[1] - t0.shape[1]), t1.shape[2]))], dim=1)
+
+            tw = torch.mul(t1, conditioning_to_strength) + torch.mul(t0, (1.0 - conditioning_to_strength))
+            t_to = conditioning_to[i][1].copy()
+            if pooled_output_from is not None and pooled_output_to is not None:
+                t_to["pooled_output"] = torch.mul(pooled_output_to, conditioning_to_strength) + torch.mul(pooled_output_from, (1.0 - conditioning_to_strength))
+            elif pooled_output_from is not None:
+                t_to["pooled_output"] = pooled_output_from
+
+            t_to["conditioning_mode"] = "block_diagonal_conditioning"
+
+            n = [tw, t_to]
+            out.append(n)
+        return (out, )
+
+
 class ConditioningConcat:
     @classmethod
     def INPUT_TYPES(s):
@@ -682,6 +947,56 @@ class DiffControlNetLoader:
         return (controlnet,)
 
 
+class ControlNetPromptTravel:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"conditioning": ("CONDITIONING", ),
+                             "control_net": ("CONTROL_NET", ),
+                             "image": ("IMAGE", ),
+                             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                             "batch_size": ("INT", {"default": 1, "min": 1, "max": 1024, "step": 1})
+                             }}
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "apply_controlnet"
+
+    CATEGORY = "conditioning"
+
+    def apply_controlnet(self, conditioning, control_net, image, strength, batch_size):
+        if strength == 0:
+            return (conditioning, )
+        
+        image_count = image.shape[0]
+        conditioning_count = len(conditioning)
+
+        if image_count != batch_size:
+            print("Warning: ConditioningPromptTravel batch size is not equal to image count. Skipping controlnet.")
+            return (conditioning, )
+
+        if conditioning_count % image_count != 0:
+            print("Warning: ConditioningPromptTravel conditioning count is not a multiple of image count. Skipping controlnet.")
+            return (conditioning, )
+
+        conditionings_per_image = conditioning_count // image_count
+
+        print(f"ConditioningPromptTravel: {conditioning_count} conditioning, {image_count} images, {conditionings_per_image} conditionings per image.")
+
+        c = []
+
+        for i, t in enumerate(conditioning):
+            
+            single_image = image[i:i+1]
+            control_hint = single_image.movedim(-1,1)
+
+
+            n = [t[0], t[1].copy()]
+            c_net = control_net.copy().set_cond_hint(control_hint, strength)
+            if 'control' in t[1]:
+                c_net.set_previous_controlnet(t[1]['control'])
+            n[1]['control'] = c_net
+            n[1]['control_apply_to_uncond'] = True
+            c.append(n)
+        return (c, )
+
 class ControlNetApply:
     @classmethod
     def INPUT_TYPES(s):
@@ -1252,6 +1567,16 @@ class SetLatentNoiseMask:
         s["noise_mask"] = mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1]))
         return (s,)
 
+
+def wrap_callbacks(callbacks):
+
+    def callback(step, x0, x, total_steps):
+        for c in callbacks:
+            c(step, x0, x, total_steps)
+
+    return callback
+
+
 def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False):
     latent_image = latent["samples"]
     if disable_noise:
@@ -1264,8 +1589,25 @@ def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, 
     if "noise_mask" in latent:
         noise_mask = latent["noise_mask"]
 
-    callback = latent_preview.prepare_callback(model, steps)
+    sampler_callbacks = []
+
+    # search key 'sampler_callback' in each conditioning
+    for c in positive:
+        if "sampler_callback" in c[1]:
+            sampler_callbacks += [c[1]["sampler_callback"]]
+
+    for c in negative:
+        if "sampler_callback" in c[1]:
+            sampler_callbacks += [c[1]["sampler_callback"]]
+
+
+    preview_callback = latent_preview.prepare_callback(model, steps)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+    
+    sampler_callbacks += [preview_callback]
+    callback = wrap_callbacks(sampler_callbacks)
+
     samples = comfy.sample.sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
                                   denoise=denoise, disable_noise=disable_noise, start_step=start_step, last_step=last_step,
                                   force_full_denoise=force_full_denoise, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)
@@ -1679,6 +2021,9 @@ NODE_CLASS_MAPPINGS = {
     "ImagePadForOutpaint": ImagePadForOutpaint,
     "EmptyImage": EmptyImage,
     "ConditioningAverage": ConditioningAverage ,
+    "ModelFramePinning": ModelFramePinning,
+    "ConditioningStepConvolution": ConditioningStepConvolution,
+    "ConditioningPromptTravel": ConditioningPromptTravel,
     "ConditioningCombine": ConditioningCombine,
     "ConditioningConcat": ConditioningConcat,
     "ConditioningSetArea": ConditioningSetArea,
@@ -1698,6 +2043,7 @@ NODE_CLASS_MAPPINGS = {
     "CLIPVisionEncode": CLIPVisionEncode,
     "StyleModelApply": StyleModelApply,
     "unCLIPConditioning": unCLIPConditioning,
+    "ControlNetPromptTravel":ControlNetPromptTravel,
     "ControlNetApply": ControlNetApply,
     "ControlNetApplyAdvanced": ControlNetApplyAdvanced,
     "ControlNetLoader": ControlNetLoader,
@@ -1743,10 +2089,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLIPSetLastLayer": "CLIP Set Last Layer",
     "ConditioningCombine": "Conditioning (Combine)",
     "ConditioningAverage ": "Conditioning (Average)",
+    "ModelFramePinning": "Model Frame Pinning (Prompt Travel)",
+    "ConditioningStepConvolution": "Step Convolution (Prompt Travel)",
+    "ConditioningPromptTravel": "Conditioning (Prompt Travel)",
     "ConditioningConcat": "Conditioning (Concat)",
     "ConditioningSetArea": "Conditioning (Set Area)",
     "ConditioningSetAreaPercentage": "Conditioning (Set Area with Percentage)",
     "ConditioningSetMask": "Conditioning (Set Mask)",
+    "ControlNetPromptTravel": "Apply ControlNet (Prompt Travel)",
     "ControlNetApply": "Apply ControlNet",
     "ControlNetApplyAdvanced": "Apply ControlNet (Advanced)",
     # Latent
