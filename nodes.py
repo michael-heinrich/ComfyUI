@@ -113,7 +113,7 @@ class ModelFramePinning:
                               "images": ("LATENT", ),
                               "model": ("MODEL", ),
                               "batch_index": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1}),
-                              "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                              "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01})
                              },
                              }
     
@@ -124,52 +124,79 @@ class ModelFramePinning:
 
     def pin_frame(self, images, model, batch_index, strength):
 
-        n_images = images.shape[0]
 
-        preloaded_image = None
+        samples = images["samples"]
+        n_images = samples.shape[0]
+
+        preloaded_samples = None
         if n_images > 1:
             # if there are multiple images, we use batch_index to select the source image
-            preloaded_image = images[batch_index]
+            preloaded_samples = samples[batch_index:batch_index+1].clone()
         elif n_images == 0:
             raise Exception("ModelFramePinning: images is empty, cannot pin frame")
         else:
             # if there is only one image, we use that
-            preloaded_image = images[0]
+            preloaded_samples = samples[0:1].clone()
 
-        
+        # the model wants to preprocess the latent state before it can be used
+        preprocessed = model.model.process_latent_in(preloaded_samples)
+
         # capture the call operator of the model into a local variable
-        tmp_call = model.__call__
+        new_model = model.clone()
+        prev_cfg_function = None
+        if "sampler_cfg_function" in model.model_options:
+            prev_cfg_function = model.model_options["sampler_cfg_function"]
 
 
+        def pin_frame(args):
+            cond = args["cond"]
+            uncond = args["uncond"]
+            cond_scale = args["cond_scale"]
+            sigma = args["sigma"]
+            sigma = sigma.view(sigma.shape[:1] + (1,) * (cond.ndim - 1))
+            x_orig = args["input"]
 
-        # we want to build a wrapper around this function:
-        # denoised = model(x, sigmas[i] * s_in, **extra_args)
-        # our wrapper will stand in for the call operator of model
-        def call_model(*args, **kwargs):
-            # call the model
-            denoised = tmp_call(*args, **kwargs)
+            # If you look at calc_cond_uncond_batch in samplers.py, where this function is called,
+            # you note that cond and uncond are are actually (x - cond) and (x - uncond)
+            # so the result of the CFG term is then x - (uncond + cond_scale * (cond - uncond))
+            # which has a very similar form as Karras ODE derivative that sampling.py calculates
+            # in to_d(). Thus, we just call it karras_d here.
+            karras_d = None
 
-            n_denoised = denoised.shape[0]
+            if prev_cfg_function is None:
+                # If we are the first CFG function, use the standard CFG formula as a base.
+                karras_d = uncond + cond_scale * (cond - uncond)
+            else:
+                # If there is a previous CFG function, call it to get the derivative and
+                # apply our changes on top of it.
+                karras_d = prev_cfg_function(args)
 
-            if batch_index >= n_denoised:
-                print(f"ModelFramePinning: batch_index {batch_index} is out of range, skipping pinning")
-                return denoised
-            
             # load the preloaded image to the device
-            uploaded_preloaded = preloaded_image.to(denoised.device)
+            uploaded_samples = preprocessed.to(karras_d.device)
 
-            # Mix the denoised image with the preloaded image.
-            # Only modify the targeted image, leave the others untouched.
-            denoised[batch_index] = strength * uploaded_preloaded + (1.0 - strength) * denoised[batch_index]
-            
-            return denoised
+            affected_x = x_orig[batch_index:batch_index+1]
+
+            # if we want to "pin" our image, we need to change the ODE derivative so that
+            # it points in the direction of our image from the current state image.
+            pin_direction = affected_x - uploaded_samples 
+
+            # calculate a norm of the remaining pin_direction:
+            l2 = torch.norm(pin_direction)
+            print(f"pin_frame: batch_index {batch_index}, l2 norm of pin_direction: {l2}")
 
 
-        # replace the call operator of the model with our wrapper
-        model.__call__ = call_model
+            # now mix our pinning derivative with the CFG derivative
+            # the strength parameter controls how much of each derivative is used.
+            # We mix only the targeted image, leave the others untouched.
+            updated_image = strength * pin_direction + (1.0 - strength) * karras_d[batch_index:batch_index+1]
 
-        return (model, )
+            karras_d[batch_index:batch_index+1] = updated_image
+
+            return karras_d
         
+        
+        new_model.set_model_sampler_cfg_function(pin_frame)
+        return (new_model, )
         
 
 
