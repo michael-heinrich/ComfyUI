@@ -72,5 +72,5 @@ def find_any(substring: str) -> list:
 
 
 # print the list of files that contain the given substring
-substring = "VideoLinearCFGGuidance"
+substring = "cond_hint"
 files = find_any(substring)

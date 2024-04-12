@@ -315,7 +315,30 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                 timestep_ = torch.ones(n_evaluations, dtype=torch.float32, device=input_x.device) * timestep[0]
 
                 if control is not None:
+                    # get the correct controlnet hints for the batch
+                    orig_hint = control.cond_hint_original
+                    n_hints = orig_hint.shape[0]
+                    n_images = input_x.shape[0]
+                    # make tensor that repeats the first image in the original hint 'batch_size' times
+                    hint = orig_hint[0:1].repeat(n_images, 1, 1, 1)
+                    # for each image in the batch, replace the hint with the corresponding hint from the original hint,
+                    # but modulo the number of hints in the original hint
+                    for i in range(n_images):
+                        off = n_images - i - 1 # because the conditionings are applied in reverse order
+                        if len(batch_offset) > i:
+                            if batch_offset[i] >= 0:
+                                off = batch_offset[i]
+                        hint[i] = orig_hint[off % n_hints]
+
+                    # temporarily replace the original hint with the batch hint
+                    control.cond_hint_original = hint
+                    cond_hint_tmp = control.cond_hint
+                    control.cond_hint = hint
                     c['control'] = control.get_control(input_x, timestep_, c, len(cond_or_uncond))
+                    
+                    # restore the original hint
+                    control.cond_hint_original = orig_hint
+                    control.cond_hint = cond_hint_tmp
 
                 transformer_options = {}
                 if 'transformer_options' in model_options:
