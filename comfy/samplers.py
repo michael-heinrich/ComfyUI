@@ -7,7 +7,8 @@ import math
 from comfy import model_base
 import comfy.utils
 import comfy.conds
-
+import logging
+import comfy.sampler_helpers
 
 
 DENSE_CONDITIONING = 'dense_conditioning'
