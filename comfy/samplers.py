@@ -14,6 +14,58 @@ import comfy.sampler_helpers
 DENSE_CONDITIONING = 'dense_conditioning'
 BLOCK_DIAGONAL_CONDITIONING = 'block_diagonal_conditioning'
 
+def select_conditioning_mode(conds, batch_size, polarity):
+    # if any of the conditionings requests block diagonal conditioning or
+    # dense conditioning, we need to use that mode for all conditionings
+    # that don't request indexed conditioning individually
+
+    if conds is None:
+        print(f"Default to dense conditioning to handle 'None' for {polarity} conditionings")
+        return DENSE_CONDITIONING
+    
+    dense_requested = False
+    block_diagonal_requested = False
+    
+    for c in conds:
+        mode = c.get('conditioning_mode', None)
+        
+        if mode == DENSE_CONDITIONING:
+            dense_requested = True
+
+        if mode == BLOCK_DIAGONAL_CONDITIONING:
+            block_diagonal_requested = True
+
+
+
+    if dense_requested and block_diagonal_requested:
+        print(f"Both dense and block diagonal conditioning requested for {polarity} conditionings, this is not supported. Falling back to dense conditioning.")
+        return DENSE_CONDITIONING
+    
+    if dense_requested:
+        print(f"Dense conditioning requested for {polarity} conditionings, using dense conditioning.")
+        return DENSE_CONDITIONING
+    
+    block_diagonal_ok = True
+
+    if len(conds) < batch_size:
+        block_diagonal_ok = False
+
+    if len(conds) % batch_size != 0:
+        block_diagonal_ok = False
+
+    if not block_diagonal_ok:
+        if block_diagonal_requested:
+            print(f"Block diagonal conditioning requested for {polarity} conditionings, but the number of conditionings is not divisible by the batch size. Falling back to dense conditioning.")
+        return DENSE_CONDITIONING
+
+    if block_diagonal_requested:
+        print(f"Block diagonal conditioning requested for {polarity} conditionings, using block diagonal conditioning.")
+        return BLOCK_DIAGONAL_CONDITIONING
+
+    
+    print("No explicit conditioning mode requested, using dense conditioning (normal mode)")
+    return DENSE_CONDITIONING
+
 def get_area_and_mult(conds, x_in, timestep_in):
     batch_offset = -1
     old_shape = timestep_in.shape
@@ -146,57 +198,7 @@ def cond_cat(c_list):
 
     return out
 
-def select_conditioning_mode(conds, batch_size, polarity):
-    # if any of the conditionings requests block diagonal conditioning or
-    # dense conditioning, we need to use that mode for all conditionings
-    # that don't request indexed conditioning individually
 
-    if conds is None:
-        print(f"Default to dense conditioning to handle 'None' for {polarity} conditionings")
-        return DENSE_CONDITIONING
-    
-    dense_requested = False
-    block_diagonal_requested = False
-    
-    for c in conds:
-        mode = c.get('conditioning_mode', None)
-        
-        if mode == DENSE_CONDITIONING:
-            dense_requested = True
-
-        if mode == BLOCK_DIAGONAL_CONDITIONING:
-            block_diagonal_requested = True
-
-
-
-    if dense_requested and block_diagonal_requested:
-        print(f"Both dense and block diagonal conditioning requested for {polarity} conditionings, this is not supported. Falling back to dense conditioning.")
-        return DENSE_CONDITIONING
-    
-    if dense_requested:
-        print(f"Dense conditioning requested for {polarity} conditionings, using dense conditioning.")
-        return DENSE_CONDITIONING
-    
-    block_diagonal_ok = True
-
-    if len(conds) < batch_size:
-        block_diagonal_ok = False
-
-    if len(conds) % batch_size != 0:
-        block_diagonal_ok = False
-
-    if not block_diagonal_ok:
-        if block_diagonal_requested:
-            print(f"Block diagonal conditioning requested for {polarity} conditionings, but the number of conditionings is not divisible by the batch size. Falling back to dense conditioning.")
-        return DENSE_CONDITIONING
-
-    if block_diagonal_requested:
-        print(f"Block diagonal conditioning requested for {polarity} conditionings, using block diagonal conditioning.")
-        return BLOCK_DIAGONAL_CONDITIONING
-
-    
-    print("No explicit conditioning mode requested, using dense conditioning (normal mode)")
-    return DENSE_CONDITIONING
 
 
 def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
