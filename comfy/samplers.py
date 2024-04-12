@@ -342,8 +342,8 @@ def calc_cond_batch(model, conds, x_in, timestep, model_options):
                 out_conds[cond_index][:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
                 out_counts[cond_index][:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
             else:
-                if off > out_conds[cond_index].shape[1]:
-                    raise Exception(f"Batch offset must be smaller than the batch size. Conditioning offset was {off} but the batch size was {out_conds[cond_index].shape[1]}")
+                if off > out_conds[cond_index].shape[0]:
+                    raise Exception(f"Batch offset must be smaller than the batch size. Conditioning offset was {off} but the batch size was {out_conds[cond_index].shape[0]}")
                 out_conds[cond_index][off:off+1,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
                 out_counts[cond_index][off:off+1,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
                 
