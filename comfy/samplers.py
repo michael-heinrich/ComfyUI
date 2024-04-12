@@ -4,8 +4,10 @@ import torch
 import collections
 from comfy import model_management
 import math
+import comfy.conds
 import logging
 import comfy.sampler_helpers
+
 
 DENSE_CONDITIONING = 'dense_conditioning'
 BLOCK_DIAGONAL_CONDITIONING = 'block_diagonal_conditioning'
@@ -30,8 +32,6 @@ def select_conditioning_mode(conds, batch_size, polarity):
 
         if mode == BLOCK_DIAGONAL_CONDITIONING:
             block_diagonal_requested = True
-
-
 
     if dense_requested and block_diagonal_requested:
         print(f"Both dense and block diagonal conditioning requested for {polarity} conditionings, this is not supported. Falling back to dense conditioning.")

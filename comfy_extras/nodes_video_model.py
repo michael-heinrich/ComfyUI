@@ -43,14 +43,33 @@ class SVD_img2vid_Conditioning:
     CATEGORY = "conditioning/video_models"
 
     def encode(self, clip_vision, init_image, vae, width, height, video_frames, motion_bucket_id, fps, augmentation_level):
-        output = clip_vision.encode_image(init_image)
-        pooled = output.image_embeds.unsqueeze(0)
+        positive = []
+
+        initial_count = init_image.shape[0]
+        if initial_count != 1 and initial_count != video_frames:
+            raise ValueError(f"init_image must have 1 or {video_frames} (same as video_frames) images, but has {initial_count}")
+        
         pixels = comfy.utils.common_upscale(init_image.movedim(-1,1), width, height, "bilinear", "center").movedim(1,-1)
         encode_pixels = pixels[:,:,:,:3]
+
         if augmentation_level > 0:
             encode_pixels += torch.randn_like(pixels) * augmentation_level
         t = vae.encode(encode_pixels)
-        positive = [[pooled, {"motion_bucket_id": motion_bucket_id, "fps": fps, "augmentation_level": augmentation_level, "concat_latent_image": t}]]
+        # concat_latent_image is originally just one image.
+        # However, in model_base.py::extra_conds() it is repeated to match the batch size.
+        # BUT, only if it does not match the batch size already, so we should be able to
+        # pass it our varying init images and it will use the correct init image for each frame.
+
+        for i in range(initial_count):
+            img = init_image[i:i+1]
+            output = clip_vision.encode_image(img)
+            pooled = output.image_embeds.unsqueeze(0)
+            
+
+            cond = [pooled, {"motion_bucket_id": motion_bucket_id, "fps": fps, "augmentation_level": augmentation_level, "concat_latent_image": t}]
+
+            positive += [cond]
+
         negative = [[torch.zeros_like(pooled), {"motion_bucket_id": motion_bucket_id, "fps": fps, "augmentation_level": augmentation_level, "concat_latent_image": torch.zeros_like(t)}]]
         latent = torch.zeros([video_frames, 4, height // 8, width // 8])
         return (positive, negative, {"samples":latent})
