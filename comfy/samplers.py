@@ -8,7 +8,7 @@ from comfy import model_base
 import comfy.utils
 import comfy.conds
 import logging
-import comfy.sampler_helpers
+# import comfy.sampler_helpers
 
 
 DENSE_CONDITIONING = 'dense_conditioning'
@@ -201,7 +201,10 @@ def cond_cat(c_list):
 
 
 
-def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
+def calc_cond_batch(model, conds, x_in, timestep, model_options):
+
+    [cond, uncond] = conds
+
     out_cond = torch.zeros_like(x_in)
     out_count = torch.ones_like(x_in) * 1e-37
 
@@ -395,22 +398,34 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
     del out_uncond_count
     return out_cond, out_uncond
 
+def cfg_function(model, cond_pred, uncond_pred, cond_scale, x, timestep, model_options={}, cond=None, uncond=None):
+    if "sampler_cfg_function" in model_options:
+        args = {"cond": x - cond_pred, "uncond": x - uncond_pred, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep,
+                "cond_denoised": cond_pred, "uncond_denoised": uncond_pred, "model": model, "model_options": model_options}
+        cfg_result = x - model_options["sampler_cfg_function"](args)
+    else:
+        cfg_result = uncond_pred + (cond_pred - uncond_pred) * cond_scale
+
+    for fn in model_options.get("sampler_post_cfg_function", []):
+        args = {"denoised": cfg_result, "cond": cond, "uncond": uncond, "model": model, "uncond_denoised": uncond_pred, "cond_denoised": cond_pred,
+                "sigma": timestep, "model_options": model_options, "input": x}
+        cfg_result = fn(args)
+
+    return cfg_result
+
 
 #The main sampling function shared by all the samplers
 #Returns denoised
 def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
-        
+    if math.isclose(cond_scale, 1.0) and model_options.get("disable_cfg1_optimization", False) == False:
+        uncond_ = None
+    else:
+        uncond_ = uncond
 
+    conds = [cond, uncond_]
+    out = calc_cond_batch(model, conds, x, timestep, model_options)
+    return cfg_function(model, out[0], out[1], cond_scale, x, timestep, model_options=model_options, cond=cond, uncond=uncond_)
 
-        if math.isclose(cond_scale, 1.0):
-            uncond = None
-
-        cond, uncond = calc_cond_uncond_batch(model, cond, uncond, x, timestep, model_options)
-        if "sampler_cfg_function" in model_options:
-            args = {"cond": x - cond, "uncond": x - uncond, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep}
-            return x - model_options["sampler_cfg_function"](args)
-        else:
-            return uncond + (cond - uncond) * cond_scale
 
 class CFGNoisePredictor(torch.nn.Module):
     def __init__(self, model):
