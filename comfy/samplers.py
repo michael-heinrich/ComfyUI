@@ -209,7 +209,7 @@ def calc_cond_batch(model, conds, x_in, timestep, model_options):
         # first, select the default conditioning batch mode, based on the number 
         # of present conditionings and the batch size
         polarity = 'positive' if i == 0 else 'negative'
-        cond_mode = select_conditioning_mode(conds[0], x_in.shape[0], polarity)
+        cond_mode = select_conditioning_mode(conds[i], x_in.shape[0], polarity)
         if cond is not None:
             if cond_mode == DENSE_CONDITIONING:
                 for x in cond:
@@ -220,10 +220,11 @@ def calc_cond_batch(model, conds, x_in, timestep, model_options):
                     to_run += [(p, i)]
             else:
                 n_conds = len(cond)
+                shape = x_in.shape
                 conds_per_image = n_conds // x_in.shape[0]
 
-                for i, x in enumerate(cond):
-                    batch_offset = x.get('batch_offset', i // conds_per_image)
+                for j, x in enumerate(cond):
+                    batch_offset = x.get('batch_offset', j // conds_per_image)
                     x['batch_offset'] = batch_offset
                     p = get_area_and_mult(x, x_in, timestep)
                     if p is None:
@@ -335,13 +336,13 @@ def calc_cond_batch(model, conds, x_in, timestep, model_options):
             output = model.apply_model(input_x, timestep_, **c).chunk(batch_chunks)
 
         for o in range(batch_chunks):
+            cond_index = cond_or_uncond[o]
             off = batch_offset[o]
             if off < 0:
-                cond_index = cond_or_uncond[o]
                 out_conds[cond_index][:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
                 out_counts[cond_index][:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
             else:
-                if off > out_conds.shape[1]:
+                if off > out_conds[cond_index].shape[1]:
                     raise Exception(f"Batch offset must be smaller than the batch size. Conditioning offset was {off} but the batch size was {out_conds.shape[1]}")
                 out_conds[cond_index][off:off+1,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
                 out_counts[cond_index][off:off+1,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
