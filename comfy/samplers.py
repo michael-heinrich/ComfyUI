@@ -1,11 +1,9 @@
 from .k_diffusion import sampling as k_diffusion_sampling
 from .extra_samplers import uni_pc
 import torch
-import enum
+import collections
 from comfy import model_management
 import math
-from comfy import model_base
-import comfy.utils
 import comfy.conds
 import logging
 import comfy.sampler_helpers
@@ -124,14 +122,12 @@ def get_area_and_mult(conds, x_in, timestep_in):
             for t in range(rr):
                 mult[:,:,:,area[1] - 1 - t:area[1] - t] *= ((1.0/rr) * (t + 1))
 
-    conditionning = {}
+    conditioning = {}
     model_conds = conds["model_conds"]
     for c in model_conds:
-        conditionning[c] = model_conds[c].process_cond(batch_size=x_in.shape[0], device=x_in.device, area=area)
+        conditioning[c] = model_conds[c].process_cond(batch_size=x_in.shape[0], device=x_in.device, area=area)
 
-    control = None
-    if 'control' in conds:
-        control = conds['control']
+    control = conds.get('control', None)
 
     patches = None
     if 'gligen' in conds:
@@ -146,7 +142,8 @@ def get_area_and_mult(conds, x_in, timestep_in):
 
         patches['middle_patch'] = [gligen_patch]
 
-    return (input_x, mult, conditionning, area, control, patches, batch_offset)
+    cond_obj = collections.namedtuple('cond_obj', ['input_x', 'mult', 'conditioning', 'area', 'control', 'patches', 'batch_offset'])
+    return cond_obj(input_x, mult, conditioning, area, control, patches, batch_offset)
 
 def cond_equal_size(c1, c2):
     if c1 is c2:
@@ -295,14 +292,14 @@ def calc_cond_batch(model, conds, x_in, timestep, model_options):
         for x in to_batch:
             o = to_run.pop(x)
             p = o[0]
-            input_x += [p[0]]
-            mult += [p[1]]
-            c += [p[2]]
-            area += [p[3]]
-            cond_or_uncond += [o[1]]
-            control = p[4]
-            patches = p[5]
-            batch_offset += [p[6]]
+            input_x.append(p.input_x)
+            mult.append(p.mult)
+            c.append(p.conditioning)
+            area.append(p.area)
+            cond_or_uncond.append(o[1])
+            control = p.control
+            patches = p.patches
+            batch_offset.append(p.batch_offset)
 
         batch_chunks = len(cond_or_uncond)
         input_x = torch.cat(input_x)
