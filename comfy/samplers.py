@@ -232,7 +232,7 @@ def calc_cond_batch(model, conds, x_in, timestep, model_options):
 
                     to_run += [(p, i)]
 
-    ignore_mem_overflow = False
+    ignore_mem_overflow = True
 
     while len(to_run) > 0:
         first = to_run[0]
