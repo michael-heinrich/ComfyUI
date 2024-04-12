@@ -8,7 +8,7 @@ from comfy import model_base
 import comfy.utils
 import comfy.conds
 import logging
-# import comfy.sampler_helpers
+import comfy.sampler_helpers
 
 
 DENSE_CONDITIONING = 'dense_conditioning'
@@ -197,9 +197,6 @@ def cond_cat(c_list):
         out[k] = conds[0].concat(conds[1:])
 
     return out
-
-
-
 
 def calc_cond_batch(model, conds, x_in, timestep, model_options):
 
