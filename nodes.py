@@ -24,6 +24,7 @@ import comfy.sample
 import comfy.sd
 import comfy.utils
 import comfy.controlnet
+import comfy.conditioning_mapping as cond_mapping
 
 import comfy.clip_vision
 
@@ -107,6 +108,403 @@ class ConditioningAverage :
             n = [tw, t_to]
             out.append(n)
         return (out, )
+
+class ModelFramePinning:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                              "images": ("LATENT", ),
+                              "model": ("MODEL", ),
+                              "batch_index": ("INT", {"default": 0, "min": -1, "max": 1024, "step": 1}),
+                              "start_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                              "end_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                              "steps": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1}),
+                             },
+                             }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "pin_frame"
+
+    CATEGORY = "conditioning"
+
+    def pin_frame(self, images, model, batch_index, start_strength, end_strength, steps):
+
+
+        samples = images["samples"]
+        n_images = samples.shape[0]
+
+        preloaded_samples = None
+
+        if batch_index > n_images - 1:
+            raise Exception(f"ModelFramePinning: batch_index {batch_index} is out of range, there are only {n_images} images")
+
+        if batch_index < 0:
+            # if batch_index is negative, we use all images
+            preloaded_samples = samples.clone()
+        elif n_images == 1:
+            # if there is only one image, we use that
+            preloaded_samples = samples[0:1].clone()
+        else:
+            # if there are multiple images, we use batch_index to select the source image
+            preloaded_samples = samples[batch_index:batch_index+1].clone()
+
+        # the model wants to preprocess the latent state before it can be used
+        preprocessed = model.model.process_latent_in(preloaded_samples)
+
+        new_model = model.clone()
+        prev_cfg_function = None
+        if "sampler_cfg_function" in model.model_options:
+            prev_cfg_function = model.model_options["sampler_cfg_function"]
+
+        # prevent shadowing of variables by using a list
+        last_sigma0_ = [None]
+        step_ = [0]
+
+        def pin_frame(args):
+            cond = args["cond"]
+            uncond = args["uncond"]
+            cond_scale = args["cond_scale"]
+            x_orig = args["input"]
+            sigmas = args["sigma"]
+
+            sigma0 = sigmas[0]
+            last_sigma0 = last_sigma0_[0]
+            step = step_[0]
+
+            if last_sigma0 is None or last_sigma0 < sigma0:
+                last_sigma0 = sigma0
+                step = 0
+                print(f"pin_frame: new run, first sigma0: {sigma0}")
+            else:
+                step += 1
+
+            last_sigma0_[0] = sigma0
+            step_[0] = step
+
+            # calculate a strength value between 0 and 1
+            strength = start_strength
+            if steps > 0:
+                if step >= steps:
+                    strength = end_strength
+                else:
+                    strength = start_strength + (end_strength - start_strength) * (step / steps)
+
+
+            # If you look at calc_cond_uncond_batch in samplers.py, where this function is called,
+            # you note that cond and uncond are are actually (x - cond) and (x - uncond)
+            # so the result of the CFG term is then x - (uncond + cond_scale * (cond - uncond))
+            # which has a very similar form as Karras ODE derivative that sampling.py calculates
+            # in to_d(). Thus, we just call it karras_d here.
+            karras_d = None
+
+            if prev_cfg_function is None:
+                # If we are the first CFG function, use the standard CFG formula as a base.
+                karras_d = uncond + cond_scale * (cond - uncond)
+            else:
+                # If there is a previous CFG function, call it to get the derivative and
+                # apply our changes on top of it.
+                karras_d = prev_cfg_function(args)
+
+            # load the preloaded image to the device
+            uploaded_samples = preprocessed.to(karras_d.device)
+
+            # select the indices of the affected images
+            start_index = batch_index
+            end_index = batch_index + 1
+
+            if batch_index < 0:
+                start_index = 0
+                end_index = n_images
+
+            affected_x = x_orig[start_index:end_index]
+
+            # if we want to "pin" our image, we need to change the ODE derivative so that
+            # it points in the direction of our image from the current state image.
+            pin_direction = affected_x - uploaded_samples
+
+            # calculate a norm of the remaining pin_direction:
+            l2 = torch.norm(pin_direction)
+            print(f"pin_frame: batch_index {batch_index}, l2 norm of pin_direction: {l2}")
+
+
+            # now mix our pinning derivative with the CFG derivative
+            # the strength parameter controls how much of each derivative is used.
+            # We mix only the targeted image, leave the others untouched.
+            updated_image = strength * pin_direction + (1.0 - strength) * karras_d[start_index:end_index]
+
+            karras_d[start_index:end_index] = updated_image
+
+            return karras_d
+
+
+        new_model.set_model_sampler_cfg_function(pin_frame)
+        return (new_model, )
+
+
+
+class ConditioningStepConvolution:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                              "model": ("MODEL", ),
+                              "sigma_threshold": ("FLOAT", {"default": 0.1, "min": 0, "max": 1000, "step": 0.01}),
+                              "kernel_size": ("INT", {"default": 5, "min": 0, "max": 1024, "step": 1}),
+                              "std_dev": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                              "boundary_condition": (["clamp", "pinned", "periodic"], {"default": "pinned"}),
+                             },
+                            }
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model")
+    FUNCTION = "apply_convolution"
+
+    CATEGORY = "conditioning"
+
+    def apply_convolution(self, model, sigma_threshold, kernel_size, std_dev, boundary_condition):
+
+
+        new_model = model.clone()
+        prev_cfg_function = None
+        if "sampler_cfg_function" in model.model_options:
+            prev_cfg_function = model.model_options["sampler_cfg_function"]
+
+
+
+
+        diff = (kernel_size - 1) // 2
+
+        # prevent shadowing of variables by using a list
+        last_sigma0_ = [None]
+        first_sigmas_ = [None]
+        step_ = [0]
+
+        def convolute_frames(args):
+            cond = args["cond"]
+            uncond = args["uncond"]
+            cond_scale = args["cond_scale"]
+            sigmas = args["sigma"]
+            x_orig = args["input"]
+
+            sigma0 = sigmas[0]
+
+            last_sigma0 = last_sigma0_[0]
+            first_sigmas = first_sigmas_[0]
+            step = step_[0]
+
+            if last_sigma0 is None or last_sigma0 < sigma0:
+                last_sigma0 = sigma0
+                first_sigmas = sigmas
+                step = 0
+                print(f"convolute_frames: new run, first sigma0: {sigma0}")
+            else:
+                step += 1
+
+            last_sigma0_[0] = sigma0
+            first_sigmas_[0] = first_sigmas
+            step_[0] = step
+
+
+            # If you look at calc_cond_uncond_batch in samplers.py, where this function is called,
+            # you note that cond and uncond are are actually (x - cond) and (x - uncond)
+            # so the result of the CFG term is then x - (uncond + cond_scale * (cond - uncond))
+            # which has a very similar form as Karras ODE derivative that sampling.py calculates
+            # in to_d(). Thus, we just call it karras_d here.
+            karras_d = None
+
+            if prev_cfg_function is None:
+                # If we are the first CFG function, use the standard CFG formula as a base.
+                karras_d = uncond + cond_scale * (cond - uncond)
+            else:
+                # If there is a previous CFG function, call it to get the derivative and
+                # apply our changes on top of it.
+                karras_d = prev_cfg_function(args)
+
+            rel_sigma = sigmas / first_sigmas
+            sqrt_rel_sigma = torch.sqrt(rel_sigma)
+
+            # slower falloff of std dev with sigma
+            faded_std_dev = std_dev * sqrt_rel_sigma
+            # make zeros with the same shape as x
+            crossed_d = torch.zeros_like(x_orig)
+
+            n_images = x_orig.shape[0]
+
+            pin_boundary = boundary_condition == "pinned"
+            periodic_boundary = boundary_condition == "periodic"
+
+            for i in range(n_images):
+                indices = []
+                weights = []
+                weight_sum = 0
+
+                sigma = sigmas[i]
+
+                if sigma < sigma_threshold:
+                    print(f"convolution skipped: image {i} at sigma {sigma} below threshold {sigma_threshold}")
+                    crossed_d[i] = karras_d[i]
+                    continue
+
+                if pin_boundary and (i == 0 or i == n_images - 1):
+                    # in pinned mode, the first and last image are not subject to the convolution
+                    # pin the boundary
+                    indices += [i]
+                    weights += [1]
+                    weight_sum += 1
+                else:
+                    # if not in pinned mode or not at the boundary, loop over the kernel
+                    for j in range(i - diff, i + diff + 1):
+                        if j < 0:
+                            if periodic_boundary:
+                                j += n_images
+                            else:
+                                continue
+
+                        if j >= n_images:
+                            if periodic_boundary:
+                                j -= n_images
+                            else:
+                                continue
+
+                        indices += [j]
+                        dist = abs(i - j)
+
+                        if periodic_boundary:
+                            # calculate the distance in the periodic domain
+                            dist = min(dist, n_images - dist)
+
+                        # gauss falloff with distance and faded std dev, prevent division by zero
+                        weight = 0
+                        img_std_dev = faded_std_dev[i]
+                        if img_std_dev < 0.0001:
+                            if dist == 0:
+                                weight = 1
+                            else:
+                                weight = 0
+                        else:
+                            weight = math.exp(-(dist * dist) / (2 * img_std_dev * img_std_dev))
+
+                        weights += [weight]
+                        weight_sum += weight
+
+                # normalize weights
+                weight_info = {}
+                for j in range(len(weights)):
+                    weights[j] /= weight_sum
+                    weight_info[indices[j]] = weights[j]
+
+                # print convolution weights
+                print(f"convolution: at sigma {sigma}, image {i}: {weight_info}")
+
+                # calculate the convolution
+                for j in range(len(indices)):
+                    source_ind = indices[j]
+                    weight = weights[j]
+                    # print(f"convolution: target image {i}, source image {source_ind}, weight {weight}")
+                    crossed_d[i] += weight * x_orig[source_ind]
+
+                # manipulate the state of the solver, so that the images are more correlated
+                x_orig[i] = crossed_d[i]
+            result = karras_d
+
+
+            return result
+            # return karras_d
+
+        new_model.set_model_sampler_cfg_function(convolute_frames)
+        return (new_model, )
+
+
+class ConditioningPromptTravel:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"conditioning_from": ("CONDITIONING", ), "conditioning_to": ("CONDITIONING", ),
+                              "batch_size": ("INT", {"default": 1, "min": 1, "max": 1024, "step": 1}),
+                              "interpolation": (["linear", "cosine"], ),
+                             }}
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "getInbetween"
+
+    CATEGORY = "conditioning"
+
+    def linear_base_function(self, t):
+        '''
+        Linear interpolation between 0 and 1. Returns a value between 0 and 1.
+        '''
+
+        if t < 0:
+            return 0
+
+        if t > 1:
+            return 1
+
+        return t
+
+
+    def cos_base_function(self, t):
+        '''
+        Cosine interpolation between 0 and 1. Returns a value between 0 and 1.
+        '''
+
+        if t < 0:
+            return 0
+
+        if t > 1:
+            return 1
+
+        return (1 - math.cos(t * math.pi)) / 2
+
+
+    def getInbetween(self, conditioning_from, conditioning_to, batch_size, interpolation):
+        n_weight_steps = batch_size - 1
+
+        if(n_weight_steps < 1):
+            return (conditioning_to, )
+
+        out = []
+
+        for i in range(batch_size):
+            t = i / n_weight_steps
+
+            to_strength = 0.5
+
+            if interpolation == "linear":
+                to_strength = self.linear_base_function(t)
+            else:
+                to_strength = self.cos_base_function(t)
+
+            (w_out, ) = self.addWeighted(conditioning_to, conditioning_from, to_strength)
+            out += w_out
+
+        return (out, )
+
+    def addWeighted(self, conditioning_to, conditioning_from, conditioning_to_strength):
+        out = []
+
+        if len(conditioning_from) > 1:
+            print("Warning: ConditioningPromptTravel conditioning_from contains more than 1 cond, only the first one will actually be applied to conditioning_to.")
+
+        cond_from = conditioning_from[0][0]
+        pooled_output_from = conditioning_from[0][1].get("pooled_output", None)
+
+        for i in range(len(conditioning_to)):
+            t1 = conditioning_to[i][0]
+            pooled_output_to = conditioning_to[i][1].get("pooled_output", pooled_output_from)
+            t0 = cond_from[:,:t1.shape[1]]
+            if t0.shape[1] < t1.shape[1]:
+                t0 = torch.cat([t0] + [torch.zeros((1, (t1.shape[1] - t0.shape[1]), t1.shape[2]))], dim=1)
+
+            tw = torch.mul(t1, conditioning_to_strength) + torch.mul(t0, (1.0 - conditioning_to_strength))
+            t_to = conditioning_to[i][1].copy()
+            if pooled_output_from is not None and pooled_output_to is not None:
+                t_to["pooled_output"] = torch.mul(pooled_output_to, conditioning_to_strength) + torch.mul(pooled_output_from, (1.0 - conditioning_to_strength))
+            elif pooled_output_from is not None:
+                t_to["pooled_output"] = pooled_output_from
+
+            t_to["conditioning_mode"] = "block_diagonal_conditioning"
+
+            n = [tw, t_to]
+            out.append(n)
+        return (out, )
+
 
 class ConditioningConcat:
     @classmethod
@@ -722,6 +1120,56 @@ class DiffControlNetLoader:
         return (controlnet,)
 
 
+class ControlNetPromptTravel:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"conditioning": ("CONDITIONING", ),
+                             "control_net": ("CONTROL_NET", ),
+                             "image": ("IMAGE", ),
+                             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                             "batch_size": ("INT", {"default": 1, "min": 1, "max": 1024, "step": 1})
+                             }}
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "apply_controlnet"
+
+    CATEGORY = "conditioning"
+
+    def apply_controlnet(self, conditioning, control_net, image, strength, batch_size):
+        if strength == 0:
+            return (conditioning, )
+
+        image_count = image.shape[0]
+        conditioning_count = len(conditioning)
+
+        if image_count != batch_size:
+            print("Warning: ConditioningPromptTravel batch size is not equal to image count. Skipping controlnet.")
+            return (conditioning, )
+
+        if conditioning_count % image_count != 0:
+            print("Warning: ConditioningPromptTravel conditioning count is not a multiple of image count. Skipping controlnet.")
+            return (conditioning, )
+
+        conditionings_per_image = conditioning_count // image_count
+
+        print(f"ConditioningPromptTravel: {conditioning_count} conditioning, {image_count} images, {conditionings_per_image} conditionings per image.")
+
+        c = []
+
+        for i, t in enumerate(conditioning):
+
+            single_image = image[i:i+1]
+            control_hint = single_image.movedim(-1,1)
+
+
+            n = [t[0], t[1].copy()]
+            c_net = control_net.copy().set_cond_hint(control_hint, strength)
+            if 'control' in t[1]:
+                c_net.set_previous_controlnet(t[1]['control'])
+            n[1]['control'] = c_net
+            n[1]['control_apply_to_uncond'] = True
+            c.append(n)
+        return (c, )
+
 class ControlNetApply:
     @classmethod
     def INPUT_TYPES(s):
@@ -741,13 +1189,14 @@ class ControlNetApply:
 
         c = []
         control_hint = image.movedim(-1,1)
+        copied_control_net = control_net.copy()
         for t in conditioning:
             n = [t[0], t[1].copy()]
-            c_net = control_net.copy().set_cond_hint(control_hint, strength)
+            c_net = copied_control_net.set_cond_hint(control_hint, strength)
             if 'control' in t[1]:
                 c_net.set_previous_controlnet(t[1]['control'])
             n[1]['control'] = c_net
-            n[1]['control_apply_to_uncond'] = True
+            n[1]['control_apply_to_uncond'] = False
             c.append(n)
         return (c, )
 
@@ -1297,6 +1746,16 @@ class SetLatentNoiseMask:
         s["noise_mask"] = mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1]))
         return (s,)
 
+
+def wrap_callbacks(callbacks):
+
+    def callback(step, x0, x, total_steps):
+        for c in callbacks:
+            c(step, x0, x, total_steps)
+
+    return callback
+
+
 def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False):
     latent_image = latent["samples"]
     if disable_noise:
@@ -1309,8 +1768,25 @@ def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, 
     if "noise_mask" in latent:
         noise_mask = latent["noise_mask"]
 
-    callback = latent_preview.prepare_callback(model, steps)
+    sampler_callbacks = []
+
+    # search key 'sampler_callback' in each conditioning
+    for c in positive:
+        if "sampler_callback" in c[1]:
+            sampler_callbacks += [c[1]["sampler_callback"]]
+
+    for c in negative:
+        if "sampler_callback" in c[1]:
+            sampler_callbacks += [c[1]["sampler_callback"]]
+
+
+    preview_callback = latent_preview.prepare_callback(model, steps)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+
+    sampler_callbacks += [preview_callback]
+    callback = wrap_callbacks(sampler_callbacks)
+
     samples = comfy.sample.sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
                                   denoise=denoise, disable_noise=disable_noise, start_step=start_step, last_step=last_step,
                                   force_full_denoise=force_full_denoise, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)
@@ -1376,6 +1852,108 @@ class KSamplerAdvanced:
         if add_noise == "disable":
             disable_noise = True
         return common_ksampler(model, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=denoise, disable_noise=disable_noise, start_step=start_at_step, last_step=end_at_step, force_full_denoise=force_full_denoise)
+
+
+class KSamplerChunked:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":
+                    {"model": ("MODEL",),
+                    "add_noise": (["enable", "disable"], ),
+                    "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                    "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                    "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step":0.1, "round": 0.01}),
+                    "sampler_name": (comfy.samplers.KSampler.SAMPLERS, ),
+                    "scheduler": (comfy.samplers.KSampler.SCHEDULERS, ),
+                    "positive": ("CONDITIONING", ),
+                    "negative": ("CONDITIONING", ),
+                    "latent_image": ("LATENT", ),
+                    "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000}),
+                    "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000}),
+                    "return_with_leftover_noise": (["disable", "enable"], ),
+                    "max_parallel_images": ("INT", {"default": 4, "min": 1, "max": 10000}),
+                     }
+                }
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+
+    CATEGORY = "sampling"
+
+    def sample(self, model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, max_parallel_images, denoise=1.0):
+        force_full_denoise = True
+        if return_with_leftover_noise == "enable":
+            force_full_denoise = False
+        disable_noise = False
+        if add_noise == "disable":
+            disable_noise = True
+
+        latent_image = latent_image.copy()
+        samples = latent_image["samples"]
+        n_images = samples.shape[0]
+
+        # to enable cross image filters, we need to process each step for every image
+        # before we can move on to the next step. However, if we are forced to split
+        # the batch into chunks, that means that we have to have an outer step loop,
+        # an inner chunk loop and invoke common_ksampler in the inner loop, with just
+        # one step at a time.
+
+
+        positive = cond_mapping.ConditioningMapping.copy_conditioning_list(positive)
+        negative = cond_mapping.ConditioningMapping.copy_conditioning_list(negative)
+
+        any_controlnet = False
+        if cond_mapping.ConditioningMapping.has_any_controlnet(positive):
+            any_controlnet = True
+        if cond_mapping.ConditioningMapping.has_any_controlnet(negative):
+            any_controlnet = True
+
+        any_block_diag = False
+        if cond_mapping.ConditioningMapping.has_any_block_diag_request(positive):
+            any_block_diag = True
+        if cond_mapping.ConditioningMapping.has_any_block_diag_request(negative):
+            any_block_diag = True
+
+        # if we have any controlnet and block_diag requests, we can only process one image at a time
+        if any_controlnet and any_block_diag:
+            print("WARNING: Cannot process multiple images in parallel when using controlnet and block_diag requests. Processing one image at a time.")
+            max_parallel_images = 1
+
+        n_chunks = math.ceil(n_images / max_parallel_images)
+
+        if end_at_step > steps:
+            end_at_step = steps
+
+        if n_chunks > 1:
+            chunk_conds = cond_mapping.ConditioningMapping.chunk_conditionings(n_images, max_parallel_images, positive, negative)
+
+            out = latent_image.copy()
+            out_samples = torch.zeros_like(samples)
+
+            for chunk in range(n_chunks):
+                (chunk_pos, chunk_neg) = chunk_conds[chunk]
+                start_image = chunk * max_parallel_images
+                end_image = min(n_images, start_image + max_parallel_images)
+                latent_image["samples"] = samples[start_image:end_image]
+
+                print(f"Sampling chunk {chunk+1}/{n_chunks} ({start_image}-{end_image})")
+                chunk_out = common_ksampler(model, noise_seed, steps, cfg, sampler_name, scheduler, chunk_pos, chunk_neg, latent_image, denoise=denoise, disable_noise=disable_noise, start_step=start_at_step, last_step=end_at_step, force_full_denoise=force_full_denoise)
+
+                out_samples[start_image:end_image] = chunk_out[0]["samples"]
+
+
+            out["samples"] = out_samples
+            return (out, )
+
+        else:
+            start_image = 0
+            end_image = n_images
+            latent_image["samples"] = samples[start_image:end_image]
+            return common_ksampler(model, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=denoise, disable_noise=disable_noise, start_step=start_at_step, last_step=end_at_step, force_full_denoise=force_full_denoise)
+
+
+
+
 
 class SaveImage:
     def __init__(self):
@@ -1740,6 +2318,9 @@ NODE_CLASS_MAPPINGS = {
     "ImagePadForOutpaint": ImagePadForOutpaint,
     "EmptyImage": EmptyImage,
     "ConditioningAverage": ConditioningAverage ,
+    "ModelFramePinning": ModelFramePinning,
+    "ConditioningStepConvolution": ConditioningStepConvolution,
+    "ConditioningPromptTravel": ConditioningPromptTravel,
     "ConditioningCombine": ConditioningCombine,
     "ConditioningConcat": ConditioningConcat,
     "ConditioningSetArea": ConditioningSetArea,
@@ -1747,6 +2328,7 @@ NODE_CLASS_MAPPINGS = {
     "ConditioningSetAreaStrength": ConditioningSetAreaStrength,
     "ConditioningSetMask": ConditioningSetMask,
     "KSamplerAdvanced": KSamplerAdvanced,
+    "KSamplerChunked": KSamplerChunked,
     "SetLatentNoiseMask": SetLatentNoiseMask,
     "LatentComposite": LatentComposite,
     "LatentBlend": LatentBlend,
@@ -1760,6 +2342,7 @@ NODE_CLASS_MAPPINGS = {
     "CLIPVisionEncode": CLIPVisionEncode,
     "StyleModelApply": StyleModelApply,
     "unCLIPConditioning": unCLIPConditioning,
+    "ControlNetPromptTravel":ControlNetPromptTravel,
     "ControlNetApply": ControlNetApply,
     "ControlNetApplyAdvanced": ControlNetApplyAdvanced,
     "ControlNetLoader": ControlNetLoader,
@@ -1788,6 +2371,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     # Sampling
     "KSampler": "KSampler",
     "KSamplerAdvanced": "KSampler (Advanced)",
+    "KSamplerChunked": "KSampler (Chunked)",
     # Loaders
     "CheckpointLoader": "Load Checkpoint With Config (DEPRECATED)",
     "CheckpointLoaderSimple": "Load Checkpoint",
@@ -1806,10 +2390,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLIPSetLastLayer": "CLIP Set Last Layer",
     "ConditioningCombine": "Conditioning (Combine)",
     "ConditioningAverage ": "Conditioning (Average)",
+    "ModelFramePinning": "Model Frame Pinning (Prompt Travel)",
+    "ConditioningStepConvolution": "Step Convolution (Prompt Travel)",
+    "ConditioningPromptTravel": "Conditioning (Prompt Travel)",
     "ConditioningConcat": "Conditioning (Concat)",
     "ConditioningSetArea": "Conditioning (Set Area)",
     "ConditioningSetAreaPercentage": "Conditioning (Set Area with Percentage)",
     "ConditioningSetMask": "Conditioning (Set Mask)",
+    "ControlNetPromptTravel": "Apply ControlNet (Prompt Travel)",
     "ControlNetApply": "Apply ControlNet",
     "ControlNetApplyAdvanced": "Apply ControlNet (Advanced)",
     # Latent
