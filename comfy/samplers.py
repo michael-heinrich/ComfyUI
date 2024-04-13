@@ -4,7 +4,6 @@ import torch
 import collections
 from comfy import model_management
 import math
-import comfy.conds
 import logging
 import comfy.sampler_helpers
 
